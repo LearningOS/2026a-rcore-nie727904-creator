@@ -71,6 +71,42 @@ lazy_static! {
 }
 
 impl TaskManager {
+        /// Map pages in the current task's address space.
+    fn mmap_current(&self, start: usize, len: usize, prot: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].memory_set.mmap_user(start, len, prot)
+    }
+
+    /// Unmap pages in the current task's address space.
+    fn munmap_current(&self, start: usize, len: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].memory_set.munmap_user(start, len)
+    }
+    /// Count a syscall for the currently running task.
+    fn record_syscall(&self, syscall_id: usize) {
+        if syscall_id >= 500 {
+            return;
+        }
+
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+
+        inner.tasks[current].syscall_counts[syscall_id] += 1;
+    }
+
+    /// Get a syscall count for the currently running task.
+    fn get_syscall_count(&self, syscall_id: usize) -> Option<usize> {
+        if syscall_id >= 500 {
+            return None;
+        }
+
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+
+        Some(inner.tasks[current].syscall_counts[syscall_id])
+    }
     /// Run the first task in task list.
     ///
     /// Generally, the first task in task list is an idle task (we call it zero process later).
@@ -201,4 +237,23 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Record a syscall made by the current task.
+pub fn record_syscall(syscall_id: usize) {
+    TASK_MANAGER.record_syscall(syscall_id);
+}
+
+/// Read the current task's syscall count.
+pub fn get_syscall_count(syscall_id: usize) -> Option<usize> {
+    TASK_MANAGER.get_syscall_count(syscall_id)
+}
+/// Map pages for the currently running task.
+pub fn mmap_current(start: usize, len: usize, prot: usize) -> isize {
+    TASK_MANAGER.mmap_current(start, len, prot)
+}
+
+/// Unmap pages for the currently running task.
+pub fn munmap_current(start: usize, len: usize) -> isize {
+    TASK_MANAGER.munmap_current(start, len)
 }

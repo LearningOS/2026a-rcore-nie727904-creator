@@ -40,6 +40,116 @@ pub struct MemorySet {
 }
 
 impl MemorySet {
+        /// Map anonymous user pages.
+    /// Return 0 on success, -1 on invalid arguments or conflicts.
+    pub fn mmap_user(&mut self, start: usize, len: usize, prot: usize) -> isize {
+        // Page alignment and valid protection bits.
+        if start % PAGE_SIZE != 0 || prot == 0 || prot & !0x7 != 0 {
+            return -1;
+        }
+
+        // This lab permits an empty mapping.
+        if len == 0 {
+            return 0;
+        }
+
+        // Avoid arithmetic overflow and Sv39 address wrapping.
+        let end = match start.checked_add(len) {
+            Some(end) if end <= (1usize << 38) => end,
+            _ => return -1,
+        };
+
+        let start_vpn = start / PAGE_SIZE;
+        let end_vpn = (end - 1) / PAGE_SIZE + 1;
+
+        // Check the entire range before changing the page table.
+        for page in start_vpn..end_vpn {
+            let vpn = VirtPageNum(page);
+            if self.translate(vpn).map_or(false, |pte| pte.is_valid()) {
+                return -1;
+            }
+        }
+
+        let mut permission = MapPermission::U;
+
+        if prot & 0x1 != 0 {
+            permission |= MapPermission::R;
+        }
+
+        if prot & 0x2 != 0 {
+            // RISC-V forbids W=1 with R=0 in a leaf PTE.
+            permission |= MapPermission::R | MapPermission::W;
+        }
+
+        if prot & 0x4 != 0 {
+            permission |= MapPermission::X;
+        }
+
+        // Use one MapArea per page so a later munmap can
+        // release any valid subset of these mappings.
+        for page in start_vpn..end_vpn {
+            let page_start = page * PAGE_SIZE;
+            self.insert_framed_area(
+                VirtAddr(page_start),
+                VirtAddr(page_start + PAGE_SIZE),
+                permission,
+            );
+        }
+
+        0
+    }
+
+    /// Remove pages previously mapped with mmap_user.
+    pub fn munmap_user(&mut self, start: usize, len: usize) -> isize {
+        if start % PAGE_SIZE != 0 {
+            return -1;
+        }
+
+        if len == 0 {
+            return 0;
+        }
+
+        let end = match start.checked_add(len) {
+            Some(end) if end <= (1usize << 38) => end,
+            _ => return -1,
+        };
+
+        let start_vpn = start / PAGE_SIZE;
+        let end_vpn = (end - 1) / PAGE_SIZE + 1;
+
+        // First validate every page. No partial unmapping on failure.
+        for page in start_vpn..end_vpn {
+            let vpn = VirtPageNum(page);
+
+            let found = self.areas.iter().any(|area| {
+                area.vpn_range.get_start() == vpn
+                    && area.vpn_range.get_end() == VirtPageNum(page + 1)
+                    && area.map_type == MapType::Framed
+                    && area.map_perm.contains(MapPermission::U)
+            });
+
+            if !found {
+                return -1;
+            }
+        }
+
+        // Remove each area's PTE and release its tracked frame.
+        for page in start_vpn..end_vpn {
+            let vpn = VirtPageNum(page);
+
+            let index = self.areas.iter().position(|area| {
+                area.vpn_range.get_start() == vpn
+                    && area.vpn_range.get_end() == VirtPageNum(page + 1)
+                    && area.map_type == MapType::Framed
+                    && area.map_perm.contains(MapPermission::U)
+            }).unwrap();
+
+            let mut area = self.areas.remove(index);
+            area.unmap(&mut self.page_table);
+        }
+
+        0
+    }
     /// Create a new empty `MemorySet`.
     pub fn new_bare() -> Self {
         Self {
