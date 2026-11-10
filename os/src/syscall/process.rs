@@ -1,3 +1,5 @@
+use crate::mm::translated_byte_buffer;
+use crate::timer::get_time_us;
 use crate::{
     fs::{open_file, OpenFlags},
     mm::{translated_ref, translated_refmut, translated_str},
@@ -151,12 +153,38 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().process.upgrade().unwrap().getpid()
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    trace!("kernel: sys_get_time");
+
+    let us = get_time_us();
+
+    let time_val = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+
+    // Convert TimeVal into bytes.
+    let mut bytes = [0u8; core::mem::size_of::<TimeVal>()];
+    let word_size = core::mem::size_of::<usize>();
+
+    bytes[..word_size].copy_from_slice(&time_val.sec.to_ne_bytes());
+    bytes[word_size..].copy_from_slice(&time_val.usec.to_ne_bytes());
+
+    // The user buffer may cross a page boundary.
+    let buffers = translated_byte_buffer(
+        current_user_token(),
+        ts as *const u8,
+        bytes.len(),
     );
-    -1
+
+    let mut offset = 0;
+    for buffer in buffers {
+        let len = buffer.len();
+        buffer.copy_from_slice(&bytes[offset..offset + len]);
+        offset += len;
+    }
+
+    0
 }
 
 /// mmap syscall

@@ -49,9 +49,91 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// Whether deadlock detection is enabled for this process.
+    pub deadlock_detection_enabled: bool,
+    /// Semaphore units held by each thread, indexed by tid and semaphore id.
+    pub sem_allocations: Vec<Vec<usize>>,
+    /// Semaphore currently requested by each thread.
+    pub sem_requests: Vec<Option<usize>>,
+    /// Owner thread ID of each mutex, if currently owned.
+    pub mutex_owner: Vec<Option<usize>>,
 }
 
 impl ProcessControlBlockInner {
+    /// Detect a deadlock using current semaphore allocations and requests.
+    pub fn semaphore_deadlocked(&self, requesting_tid: usize) -> bool {
+        let resource_count = self.semaphore_list.len();
+        let thread_count = self.sem_allocations.len();
+
+        let mut work = Vec::new();
+        for sem in &self.semaphore_list {
+            let available = sem.as_ref().map_or(0, |sem| {
+                sem.inner.exclusive_access().count.max(0) as usize
+            });
+            work.push(available);
+        }
+
+        let mut finish = vec![false; thread_count];
+
+        loop {
+            let mut progress = false;
+
+            for tid in 0..thread_count {
+                if finish[tid] {
+                    continue;
+                }
+
+                let request = self.sem_requests.get(tid).and_then(|r| *r);
+                let can_finish = match request {
+                    Some(id) if id < resource_count => {
+                        // A previously blocked thread may have been woken
+                        // by semaphore_up(), but not yet resumed from down().
+                        // It no longer appears in the semaphore wait queue.
+                        //
+                        // The thread making the current request has not
+                        // entered down() yet, so exclude it from this rule.
+                        let already_woken = tid != requesting_tid
+                            && self.tasks.get(tid)
+                                .and_then(|task| task.as_ref())
+                                .map_or(false, |task| {
+                                    self.semaphore_list[id]
+                                        .as_ref()
+                                        .map_or(false, |sem| {
+                                            let sem_inner = sem.inner.exclusive_access();
+                                            !sem_inner.wait_queue.iter().any(|waiter| {
+                                                Arc::ptr_eq(waiter, task)
+                                            })
+                                        })
+                                });
+
+                        already_woken || work[id] > 0
+                    }
+                    Some(_) => false,
+                    None => true,
+                };
+
+                if !can_finish {
+                    continue;
+                }
+
+                finish[tid] = true;
+                progress = true;
+
+                for (id, held) in self.sem_allocations[tid].iter().enumerate() {
+                    if id < resource_count {
+                        work[id] += *held;
+                    }
+                }
+            }
+
+            if !progress {
+                break;
+            }
+        }
+
+        finish.iter().any(|finished| !finished)
+    }
+
     #[allow(unused)]
     /// get the address of app's page table
     pub fn get_user_token(&self) -> usize {
@@ -119,6 +201,10 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detection_enabled: false,
+                    sem_allocations: Vec::new(),
+                    sem_requests: Vec::new(),
+                    mutex_owner: Vec::new(),
                 })
             },
         });
@@ -245,6 +331,10 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detection_enabled: false,
+                    sem_allocations: Vec::new(),
+                    sem_requests: Vec::new(),
+                    mutex_owner: Vec::new(),
                 })
             },
         });
